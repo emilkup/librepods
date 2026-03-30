@@ -30,6 +30,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.kavishdevar.librepods.services.AirPodsService
+import me.kavishdevar.librepods.services.AirPodsService.HeadTrackingReason
 import me.kavishdevar.librepods.services.ServiceManager
 import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
@@ -88,6 +89,7 @@ class GestureDetector(
     private var isRunning = false
     private var detectionJob: Job? = null
     private var gestureDetectedCallback: ((Boolean) -> Unit)? = null
+    private var activeHeadTrackingReason: HeadTrackingReason? = null
 
     private var significantMotion = false
     private var lastSignificantMotionTime = 0L
@@ -97,14 +99,15 @@ class GestureDetector(
         while (verticalAvgBuffer.size < 3) verticalAvgBuffer.add(0.0)
     }
 
-fun startDetection(doNotStop: Boolean = false, onGestureDetected: (Boolean) -> Unit) {
+    fun startDetection(reason: HeadTrackingReason, onGestureDetected: (Boolean) -> Unit) {
         if (isRunning) return
 
         Log.d(TAG, "Starting gesture detection...")
         isRunning = true
         gestureDetectedCallback = onGestureDetected
+        activeHeadTrackingReason = reason
 
-        Log.d(TAG, "started: ${airPodsService.startHeadTracking()}")
+        airPodsService.requestHeadTracking(reason)
 
         clearData()
 
@@ -121,20 +124,24 @@ fun startDetection(doNotStop: Boolean = false, onGestureDetected: (Boolean) -> U
                         audio.playConfirmation(gesture)
 
                         gestureDetectedCallback?.invoke(gesture)
-                        stopDetection(doNotStop)
+                        stopDetection()
                     }
                     break
                 }
             }
         }
     }
-    fun stopDetection(doNotStop: Boolean = false) {
+
+    fun stopDetection() {
         if (!isRunning) return
 
         Log.d(TAG, "Stopping gesture detection")
         isRunning = false
 
-        if (!doNotStop) airPodsService.stopHeadTracking()
+        activeHeadTrackingReason?.let {
+            airPodsService.releaseHeadTracking(it)
+        }
+        activeHeadTrackingReason = null
 
         detectionJob?.cancel()
         detectionJob = null

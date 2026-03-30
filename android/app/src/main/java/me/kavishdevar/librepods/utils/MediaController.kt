@@ -197,6 +197,7 @@ object MediaController {
             }
 
             lastKnownIsMusicActive = hasNewMusicOrMovie && isActive
+            ServiceManager.getService()?.refreshSleepMonitoring()
         }
     }
 

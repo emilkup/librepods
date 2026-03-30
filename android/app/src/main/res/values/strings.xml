@@ -88,6 +88,10 @@
     <string name="automatically_connect">Connect to this device automatically</string>
     <string name="automatically_connect_description">When enabled, AirPods will try to connect to this device automatically. Else, they will try to autoconnect only when last connected.</string>
     <string name="sleep_detection">Pause media when falling asleep</string>
+    <string name="bedtime_sleep_pause">Bedtime Sleep Pause (Experimental)</string>
+    <string name="bedtime_sleep_pause_description">Uses head tracking to pause media when it looks like you are falling asleep. Arms nightly from the selected time for the next 12 hours.</string>
+    <string name="bedtime_sleep_pause_start_time">Arm after</string>
+    <string name="bedtime_sleep_pause_start_time_description">Head tracking will only monitor for sleep after this time.</string>
     <string name="off_listening_mode">Off Listening Mode</string>
     <string name="off_listening_mode_description">When this is on, AirPods listening modes will include an Off option. Loud sound levels are not reduced when the listening mode is set to Off.</string>
     <string name="microphone">Microphone</string>

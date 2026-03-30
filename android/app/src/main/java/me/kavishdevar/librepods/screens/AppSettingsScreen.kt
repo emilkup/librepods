@@ -18,7 +18,9 @@
 
 package me.kavishdevar.librepods.screens
 
+import android.app.TimePickerDialog
 import android.content.Context
+import android.text.format.DateFormat
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -85,6 +87,7 @@ import me.kavishdevar.librepods.composables.StyledSlider
 import me.kavishdevar.librepods.composables.StyledToggle
 import me.kavishdevar.librepods.utils.AACPManager
 import me.kavishdevar.librepods.utils.RadareOffsetFinder
+import java.util.Locale
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.math.roundToInt
@@ -177,6 +180,15 @@ fun AppSettingsScreen(navController: NavController) {
 
     val useAlternateHeadTrackingPackets = remember {
         mutableStateOf(sharedPreferences.getBoolean("use_alternate_head_tracking_packets", false))
+    }
+    val bedtimeSleepPauseEnabled = remember {
+        mutableStateOf(sharedPreferences.getBoolean("bedtime_sleep_pause_enabled", false))
+    }
+    val bedtimeSleepPauseHour = remember {
+        mutableStateOf(sharedPreferences.getInt("bedtime_sleep_pause_hour", 22))
+    }
+    val bedtimeSleepPauseMinute = remember {
+        mutableStateOf(sharedPreferences.getInt("bedtime_sleep_pause_minute", 0))
     }
 
     fun validateHexInput(input: String): Boolean {
@@ -566,6 +578,99 @@ fun AppSettingsScreen(navController: NavController) {
             )
 
             Spacer(modifier = Modifier.height(16.dp))
+
+            StyledToggle(
+                label = stringResource(R.string.bedtime_sleep_pause),
+                description = stringResource(R.string.bedtime_sleep_pause_description),
+                checkedState = bedtimeSleepPauseEnabled,
+                onCheckedChange = {
+                    bedtimeSleepPauseEnabled.value = it
+                    sharedPreferences.edit { putBoolean("bedtime_sleep_pause_enabled", it) }
+                },
+                independent = true
+            )
+
+            if (bedtimeSleepPauseEnabled.value) {
+                Spacer(modifier = Modifier.height(8.dp))
+
+                val bedtimeTimeText = String.format(
+                    Locale.getDefault(),
+                    "%02d:%02d",
+                    bedtimeSleepPauseHour.value,
+                    bedtimeSleepPauseMinute.value
+                )
+
+                Box(
+                    modifier = Modifier
+                        .background(backgroundColor, RoundedCornerShape(28.dp))
+                        .padding(4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(
+                                onClick = {
+                                    TimePickerDialog(
+                                        context,
+                                        { _, hourOfDay, minute ->
+                                            bedtimeSleepPauseHour.value = hourOfDay
+                                            bedtimeSleepPauseMinute.value = minute
+                                            sharedPreferences.edit {
+                                                putInt("bedtime_sleep_pause_hour", hourOfDay)
+                                                putInt("bedtime_sleep_pause_minute", minute)
+                                            }
+                                        },
+                                        bedtimeSleepPauseHour.value,
+                                        bedtimeSleepPauseMinute.value,
+                                        DateFormat.is24HourFormat(context)
+                                    ).show()
+                                },
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() }
+                            )
+                            .height(55.dp)
+                            .padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = stringResource(R.string.bedtime_sleep_pause_start_time),
+                                style = TextStyle(
+                                    fontSize = 16.sp,
+                                    fontFamily = FontFamily(Font(R.font.sf_pro)),
+                                    fontWeight = FontWeight.Normal,
+                                    color = textColor
+                                )
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = stringResource(R.string.bedtime_sleep_pause_start_time_description),
+                                style = TextStyle(
+                                    fontSize = 12.sp,
+                                    color = textColor.copy(0.6f),
+                                    fontFamily = FontFamily(Font(R.font.sf_pro)),
+                                )
+                            )
+                        }
+
+                        Text(
+                            text = bedtimeTimeText,
+                            style = TextStyle(
+                                fontSize = 16.sp,
+                                fontFamily = FontFamily(Font(R.font.sf_pro)),
+                                fontWeight = FontWeight.Medium,
+                                color = textColor
+                            )
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+            } else {
+                Spacer(modifier = Modifier.height(16.dp))
+            }
 
             NavigationButton(
                 to = "troubleshooting",

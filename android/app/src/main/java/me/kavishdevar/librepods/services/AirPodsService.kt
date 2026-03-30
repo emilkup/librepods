@@ -93,6 +93,7 @@ import me.kavishdevar.librepods.utils.AirPodsInstance
 import me.kavishdevar.librepods.utils.AirPodsModels
 import me.kavishdevar.librepods.utils.BLEManager
 import me.kavishdevar.librepods.utils.BluetoothConnectionManager
+import me.kavishdevar.librepods.utils.Capability
 //import me.kavishdevar.librepods.utils.CrossDevice
 //import me.kavishdevar.librepods.utils.CrossDevicePackets
 import me.kavishdevar.librepods.utils.GestureDetector
@@ -101,6 +102,7 @@ import me.kavishdevar.librepods.utils.IslandType
 import me.kavishdevar.librepods.utils.IslandWindow
 import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.PopupWindow
+import me.kavishdevar.librepods.utils.SleepDetector
 import me.kavishdevar.librepods.utils.SystemApisUtils
 import me.kavishdevar.librepods.utils.SystemApisUtils.DEVICE_TYPE_UNTETHERED_HEADSET
 import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_COMPANION_APP
@@ -125,10 +127,13 @@ import me.kavishdevar.librepods.widgets.NoiseControlWidget
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Calendar
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
 private const val TAG = "AirPodsService"
+private const val BEDTIME_WINDOW_MINUTES = 12 * 60
+private const val SLEEP_MONITOR_REFRESH_INTERVAL_MS = 60_000L
 
 object ServiceManager {
     @ExperimentalEncodingApi
@@ -165,6 +170,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         var showPhoneBatteryInWidget: Boolean = true,
         var relativeConversationalAwarenessVolume: Boolean = true,
         var headGestures: Boolean = true,
+        var bedtimeSleepPauseEnabled: Boolean = false,
+        var bedtimeSleepPauseHour: Int = 22,
+        var bedtimeSleepPauseMinute: Int = 0,
         var disconnectWhenNotWearing: Boolean = false,
         var conversationalAwarenessVolume: Int = 43,
         var qsClickBehavior: String = "cycle",
@@ -227,12 +235,30 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private lateinit var phoneStateListener: PhoneStateListener
     private val maxLogEntries = 1000
     private val inMemoryLogs = mutableSetOf<String>()
+    private val sleepDetector = SleepDetector()
+    private val sleepMonitoringHandler = Handler(Looper.getMainLooper())
+    private var sleepPauseTriggeredForWearSession = false
 
     private var handleIncomingCallOnceConnected = false
 
     lateinit var bleManager: BLEManager
 
     private lateinit var socket: BluetoothSocket
+
+    enum class HeadTrackingReason {
+        SCREEN,
+        CALL_GESTURE,
+        GESTURE_TEST,
+        CONNECT_WARMUP,
+        SLEEP_MONITOR
+    }
+
+    private val headTrackingReasons = mutableSetOf<HeadTrackingReason>()
+    private val sleepMonitoringRefreshRunnable = object : Runnable {
+        override fun run() {
+            refreshSleepMonitoring()
+        }
+    }
 
     private val bleStatusListener = object : BLEManager.AirPodsStatusListener {
         @SuppressLint("NewApi")
@@ -444,6 +470,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 if (!contains("long_press_off")) putBoolean("long_press_off", false)
                 if (!contains("volume_control")) putBoolean("volume_control", true)
                 if (!contains("head_gestures")) putBoolean("head_gestures", true)
+                if (!contains("bedtime_sleep_pause_enabled")) putBoolean("bedtime_sleep_pause_enabled", false)
+                if (!contains("bedtime_sleep_pause_hour")) putInt("bedtime_sleep_pause_hour", 22)
+                if (!contains("bedtime_sleep_pause_minute")) putInt("bedtime_sleep_pause_minute", 0)
                 if (!contains("disconnect_when_not_wearing")) putBoolean(
                     "disconnect_when_not_wearing",
                     false
@@ -601,6 +630,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                             callNumber = phoneNumber
                             handleIncomingCall()
                         }
+                        refreshSleepMonitoring()
                     }
                     TelephonyManager.CALL_STATE_OFFHOOK -> {
                         val leAvailableForAudio = bleManager.getMostRecentStatus()?.isLeftInEar == true || bleManager.getMostRecentStatus()?.isRightInEar == true
@@ -610,16 +640,19 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                                 takeOver("call")
                         }
                         isInCall = true
+                        refreshSleepMonitoring()
                     }
                     TelephonyManager.CALL_STATE_IDLE -> {
                         isInCall = false
                         callNumber = null
                         gestureDetector?.stopDetection()
+                        refreshSleepMonitoring()
                     }
                 }
             }
         }
         telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_CALL_STATE)
+        refreshSleepMonitoring()
 
         if (config.showPhoneBatteryInWidget) {
             widgetMobileBatteryEnabled = true
@@ -916,6 +949,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         device
                     )
                 }
+                refreshSleepMonitoring()
             }
 
             override fun onOwnershipToFalseRequest(sender: String, reasonReverseTapped: Boolean) {
@@ -1016,13 +1050,17 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         attManager = attManager
                     )
                 }
+                refreshSleepMonitoring()
             }
 
             @SuppressLint("NewApi")
             override fun onHeadTrackingReceived(headTracking: ByteArray) {
                 if (isHeadTrackingActive) {
                     HeadTracking.processPacket(headTracking)
-                    processHeadTrackingData(headTracking)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        processHeadTrackingData(headTracking)
+                    }
+                    handleSleepDetectorSample()
                 }
             }
 
@@ -1182,6 +1220,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 }
             }
         }
+        refreshSleepMonitoring()
     }
 
     private fun registerA2dpConnectionReceiver() {
@@ -1224,6 +1263,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             showPhoneBatteryInWidget = sharedPreferences.getBoolean("show_phone_battery_in_widget", true),
             relativeConversationalAwarenessVolume = sharedPreferences.getBoolean("relative_conversational_awareness_volume", true),
             headGestures = sharedPreferences.getBoolean("head_gestures", true),
+            bedtimeSleepPauseEnabled = sharedPreferences.getBoolean("bedtime_sleep_pause_enabled", false),
+            bedtimeSleepPauseHour = sharedPreferences.getInt("bedtime_sleep_pause_hour", 22),
+            bedtimeSleepPauseMinute = sharedPreferences.getInt("bedtime_sleep_pause_minute", 0),
             disconnectWhenNotWearing = sharedPreferences.getBoolean("disconnect_when_not_wearing", false),
             conversationalAwarenessVolume = sharedPreferences.getInt("conversational_awareness_volume", 43),
             qsClickBehavior = sharedPreferences.getString("qs_click_behavior", "cycle") ?: "cycle",
@@ -1285,6 +1327,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             }
             "relative_conversational_awareness_volume" -> config.relativeConversationalAwarenessVolume = preferences.getBoolean(key, true)
             "head_gestures" -> config.headGestures = preferences.getBoolean(key, true)
+            "bedtime_sleep_pause_enabled" -> config.bedtimeSleepPauseEnabled = preferences.getBoolean(key, false)
+            "bedtime_sleep_pause_hour" -> config.bedtimeSleepPauseHour = preferences.getInt(key, 22)
+            "bedtime_sleep_pause_minute" -> config.bedtimeSleepPauseMinute = preferences.getInt(key, 0)
             "disconnect_when_not_wearing" -> config.disconnectWhenNotWearing = preferences.getBoolean(key, false)
             "conversational_awareness_volume" -> config.conversationalAwarenessVolume = preferences.getInt(key, 43)
             "qs_click_behavior" -> config.qsClickBehavior = preferences.getString(key, "cycle") ?: "cycle"
@@ -1364,6 +1409,15 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
             "self_mac_address" -> config.selfMacAddress = preferences.getString(key, "") ?: ""
         }
+
+        if (key in setOf(
+                "bedtime_sleep_pause_enabled",
+                "bedtime_sleep_pause_hour",
+                "bedtime_sleep_pause_minute"
+            )
+        ) {
+            refreshSleepMonitoring()
+        }
     }
 
     private fun logPacket(packet: ByteArray, @Suppress("SameParameterValue") source: String) {
@@ -1420,6 +1474,112 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (gestureDetector == null) {
             gestureDetector = GestureDetector(this)
         }
+    }
+
+    private fun maybeScheduleSleepMonitoringRefresh() {
+        sleepMonitoringHandler.removeCallbacks(sleepMonitoringRefreshRunnable)
+        if (config.bedtimeSleepPauseEnabled) {
+            sleepMonitoringHandler.postDelayed(
+                sleepMonitoringRefreshRunnable,
+                SLEEP_MONITOR_REFRESH_INTERVAL_MS
+            )
+        }
+    }
+
+    private fun isWithinBedtimeWindow(nowMillis: Long = System.currentTimeMillis()): Boolean {
+        val calendar = Calendar.getInstance().apply {
+            timeInMillis = nowMillis
+        }
+        val nowMinutes = calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE)
+        val bedtimeMinutes = config.bedtimeSleepPauseHour * 60 + config.bedtimeSleepPauseMinute
+        val minutesSinceBedtime =
+            (nowMinutes - bedtimeMinutes + 24 * 60) % (24 * 60)
+
+        return minutesSinceBedtime in 0 until BEDTIME_WINDOW_MINUTES
+    }
+
+    private fun currentModelSupportsSleepMonitoring(): Boolean {
+        return airpodsInstance?.model?.capabilities?.contains(Capability.HEAD_GESTURES) == true
+    }
+
+    private fun isAnyBudInEar(): Boolean {
+        val bleStatus = bleManager.getMostRecentStatus()
+        if (bleStatus != null) {
+            return bleStatus.isLeftInEar || bleStatus.isRightInEar
+        }
+
+        return earDetectionNotification.status.any { it == 0x00.toByte() }
+    }
+
+    private fun isLocalPlaybackActive(): Boolean {
+        return runCatching { MediaController.getMusicActive() }.getOrDefault(false)
+    }
+
+    private fun isSleepMonitoringEligible(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        if (!config.bedtimeSleepPauseEnabled) return false
+        if (!currentModelSupportsSleepMonitoring()) return false
+        if (!isWithinBedtimeWindow()) return false
+        if (isInCall) return false
+        if (!isConnectedLocally || !this::socket.isInitialized || !socket.isConnected) return false
+        if (!isAnyBudInEar()) return false
+        if (!isLocalPlaybackActive()) return false
+
+        val ownsConnection =
+            aacpManager.getControlCommandStatus(AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION)
+                ?.value
+                ?.firstOrNull() == 0x01.toByte()
+
+        return ownsConnection
+    }
+
+    private fun handleSleepDetectorSample() {
+        if (!headTrackingReasons.contains(HeadTrackingReason.SLEEP_MONITOR)) return
+        if (sleepPauseTriggeredForWearSession) return
+
+        val didDetectSleep = sleepDetector.processSample(HeadTracking.orientation.value)
+        if (!didDetectSleep) return
+
+        Log.d(TAG, "Bedtime sleep pause triggered")
+        sleepPauseTriggeredForWearSession = true
+        MediaController.sendPause(force = true)
+        refreshSleepMonitoring()
+    }
+
+    fun refreshSleepMonitoring() {
+        if (!::config.isInitialized) return
+
+        if (!config.bedtimeSleepPauseEnabled || !currentModelSupportsSleepMonitoring()) {
+            sleepPauseTriggeredForWearSession = false
+            val wasMonitoring = headTrackingReasons.contains(HeadTrackingReason.SLEEP_MONITOR)
+            releaseHeadTracking(HeadTrackingReason.SLEEP_MONITOR)
+            if (wasMonitoring) {
+                sleepDetector.reset()
+            }
+            maybeScheduleSleepMonitoringRefresh()
+            return
+        }
+
+        if (!isWithinBedtimeWindow() || !isAnyBudInEar() || !isLocalPlaybackActive()) {
+            sleepPauseTriggeredForWearSession = false
+        }
+
+        val shouldMonitor = isSleepMonitoringEligible() && !sleepPauseTriggeredForWearSession
+        val wasMonitoring = headTrackingReasons.contains(HeadTrackingReason.SLEEP_MONITOR)
+
+        if (shouldMonitor) {
+            if (!wasMonitoring) {
+                sleepDetector.reset()
+            }
+            requestHeadTracking(HeadTrackingReason.SLEEP_MONITOR, allowTakeOver = false)
+        } else {
+            releaseHeadTracking(HeadTrackingReason.SLEEP_MONITOR)
+            if (wasMonitoring) {
+                sleepDetector.reset()
+            }
+        }
+
+        maybeScheduleSleepMonitoringRefresh()
     }
 
 
@@ -1876,8 +2036,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (isInCall) return
         if (config.headGestures) {
             initGestureDetector()
-            startHeadTracking()
-            gestureDetector?.startDetection { accepted ->
+            gestureDetector?.startDetection(HeadTrackingReason.CALL_GESTURE) { accepted ->
                 if (accepted) {
                     answerCall()
                     handleIncomingCallOnceConnected = false
@@ -1893,7 +2052,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     @OptIn(ExperimentalCoroutinesApi::class)
     suspend fun testHeadGestures(): Boolean {
         return suspendCancellableCoroutine { continuation ->
-            gestureDetector?.startDetection(doNotStop = true) { accepted ->
+            gestureDetector?.startDetection(HeadTrackingReason.GESTURE_TEST) { accepted ->
                 if (continuation.isActive) {
                     continuation.resume(accepted) {
                         gestureDetector?.stopDetection()
@@ -2255,7 +2414,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     } else if (startHeadTrackingAgain) {
                         Log.d(TAG, "Starting head tracking again after taking control")
                         Handler(Looper.getMainLooper()).postDelayed({
-                            startHeadTracking()
+                            restartHeadTrackingAfterTakeOver()
                         }, 500)
                     }
                     delay(1000) // should ideally have a callback when it's taken over because for some reason android doesn't dispatch when it's paused
@@ -2484,19 +2643,26 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         aacpManager.sendSomePacketIDontKnowWhatItIs()
                         delay(200)
                         aacpManager.sendRequestProximityKeys((AACPManager.Companion.ProximityKeyType.IRK.value+AACPManager.Companion.ProximityKeyType.ENC_KEY.value).toByte())
-                        if (!handleIncomingCallOnceConnected) startHeadTracking() else handleIncomingCall()
+                        if (!handleIncomingCallOnceConnected) {
+                            requestHeadTracking(HeadTrackingReason.CONNECT_WARMUP, allowTakeOver = false)
+                        } else {
+                            handleIncomingCall()
+                        }
                         Handler(Looper.getMainLooper()).postDelayed({
                             aacpManager.sendPacket(aacpManager.createHandshakePacket())
                             aacpManager.sendSetFeatureFlagsPacket()
                             aacpManager.sendNotificationRequest()
                             aacpManager.sendRequestProximityKeys(AACPManager.Companion.ProximityKeyType.IRK.value)
-                            if (!handleIncomingCallOnceConnected) stopHeadTracking()
+                            if (!handleIncomingCallOnceConnected) {
+                                releaseHeadTracking(HeadTrackingReason.CONNECT_WARMUP)
+                            }
                         }, 5000)
 
                         sendBroadcast(
                             Intent(AirPodsNotifications.AIRPODS_CONNECTED)
                                 .putExtra("device", device)
                         )
+                        refreshSleepMonitoring()
 
                         setupStemActions()
 
@@ -2528,27 +2694,33 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
                                 } else if (bytesRead == -1) {
                                     Log.d("AirPods Service", "Socket closed (bytesRead = -1)")
+                                    isHeadTrackingActive = false
                                     sendBroadcast(Intent(AirPodsNotifications.AIRPODS_DISCONNECTED))
                                     aacpManager.disconnected()
+                                    refreshSleepMonitoring()
                                     return@launch
                                 }
                             }
                         }
                         Log.d("AirPods Service", "Socket closed")
+                        isHeadTrackingActive = false
                         isConnectedLocally = false
                         socket.close()
                         aacpManager.disconnected()
                         updateNotificationContent(false)
                         sendBroadcast(Intent(AirPodsNotifications.AIRPODS_DISCONNECTED))
+                        refreshSleepMonitoring()
                     }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
                 Log.d(TAG, "Failed to connect to socket: ${e.message}")
                 showSocketConnectionFailureNotification("Failed to establish connection: ${e.localizedMessage}")
+                isHeadTrackingActive = false
                 isConnectedLocally = false
                 this@AirPodsService.device = device
                 updateNotificationContent(false)
+                refreshSleepMonitoring()
             }
         } else {
             Log.d(TAG, "Already connected locally, skipping socket connection (isConnectedLocally = $isConnectedLocally, socket.isConnected = ${this::socket.isInitialized && socket.isConnected})")
@@ -2577,6 +2749,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             override fun onServiceDisconnected(profile: Int) {}
         }, BluetoothProfile.A2DP)
         isConnectedLocally = false
+        isHeadTrackingActive = false
+        refreshSleepMonitoring()
 //        CrossDevice.isAvailable = true
     }
 
@@ -2584,6 +2758,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (!this::socket.isInitialized) return
         socket.close()
         isConnectedLocally = false
+        isHeadTrackingActive = false
         aacpManager.disconnected()
         attManager?.disconnect()
         updateNotificationContent(false)
@@ -2604,6 +2779,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             override fun onServiceDisconnected(profile: Int) {}
         }, BluetoothProfile.A2DP)
         Log.d(TAG, "Disconnected AirPods upon user request")
+        refreshSleepMonitoring()
 
     }
 
@@ -2770,6 +2946,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             e.printStackTrace()
         }
         telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_NONE)
+        isHeadTrackingActive = false
+        sleepMonitoringHandler.removeCallbacks(sleepMonitoringRefreshRunnable)
         isConnectedLocally = false
 //        CrossDevice.isAvailable = true
         super.onDestroy()
@@ -2777,13 +2955,23 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     var isHeadTrackingActive = false
 
-    fun startHeadTracking() {
+    @Synchronized
+    private fun activateHeadTracking(allowTakeOver: Boolean) {
         isHeadTrackingActive = true
         val useAlternatePackets = sharedPreferences.getBoolean("use_alternate_head_tracking_packets", false)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && aacpManager.getControlCommandStatus(AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION)?.value?.get(0)?.toInt() != 1) {
+        val ownsConnection =
+            aacpManager.getControlCommandStatus(AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION)
+                ?.value
+                ?.getOrNull(0)
+                ?.toInt() == 1
+        if (
+            allowTakeOver &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            !ownsConnection
+        ) {
             takeOver("call", startHeadTrackingAgain = true)
             Log.d(TAG, "Taking over for head tracking")
-        } else {
+        } else if (allowTakeOver && !ownsConnection) {
             Log.w(TAG, "Will not be taking over for head tracking, might not work.")
         }
         if (useAlternatePackets) {
@@ -2792,9 +2980,13 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             aacpManager.sendStartHeadTracking()
         }
         HeadTracking.reset()
+        if (headTrackingReasons.contains(HeadTrackingReason.SLEEP_MONITOR)) {
+            sleepDetector.reset()
+        }
     }
 
-    fun stopHeadTracking() {
+    @Synchronized
+    private fun deactivateHeadTracking() {
         val useAlternatePackets = sharedPreferences.getBoolean("use_alternate_head_tracking_packets", false)
         if (useAlternatePackets) {
             aacpManager.sendDataPacket(aacpManager.createAlternateStopHeadTrackingPacket())
@@ -2802,6 +2994,39 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             aacpManager.sendStopHeadTracking()
         }
         isHeadTrackingActive = false
+    }
+
+    @Synchronized
+    fun requestHeadTracking(reason: HeadTrackingReason, allowTakeOver: Boolean = true) {
+        if (!headTrackingReasons.add(reason) && isHeadTrackingActive) return
+        if (!isHeadTrackingActive) {
+            activateHeadTracking(allowTakeOver)
+        } else {
+            isHeadTrackingActive = true
+        }
+    }
+
+    @Synchronized
+    fun releaseHeadTracking(reason: HeadTrackingReason) {
+        if (!headTrackingReasons.remove(reason)) return
+        if (headTrackingReasons.isEmpty() && isHeadTrackingActive) {
+            deactivateHeadTracking()
+        }
+    }
+
+    private fun restartHeadTrackingAfterTakeOver() {
+        synchronized(this) {
+            if (headTrackingReasons.isEmpty()) return
+            activateHeadTracking(allowTakeOver = false)
+        }
+    }
+
+    fun startHeadTracking() {
+        requestHeadTracking(HeadTrackingReason.SCREEN)
+    }
+
+    fun stopHeadTracking() {
+        releaseHeadTracking(HeadTrackingReason.SCREEN)
     }
 
     @SuppressLint("MissingPermission")
