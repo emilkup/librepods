@@ -28,6 +28,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -599,6 +600,7 @@ fun AppSettingsScreen(navController: NavController) {
                     bedtimeSleepPauseHour.value,
                     bedtimeSleepPauseMinute.value
                 )
+                val bedtimeTimeInteractionSource = remember { MutableInteractionSource() }
 
                 Box(
                     modifier = Modifier
@@ -626,7 +628,7 @@ fun AppSettingsScreen(navController: NavController) {
                                     ).show()
                                 },
                                 indication = null,
-                                interactionSource = remember { MutableInteractionSource() }
+                                interactionSource = bedtimeTimeInteractionSource
                             )
                             .height(55.dp)
                             .padding(horizontal = 12.dp),
